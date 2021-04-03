@@ -27,6 +27,7 @@ import json
 from operator import add
 from typing import List, Optional, Tuple, Union
 
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -82,6 +83,14 @@ DISCRIMINATOR_MODELS_PARAMS = {
         "embed_size": 1024,
         "class_vocab": {"very_positive": 2, "very_negative": 3},
         "default_class": 3,
+        "pretrained_model": "gpt2-medium",
+    },
+    "toxicity": {
+        "path": "",
+        "class_size": 2,
+        "embed_size": 1024,
+        "class_vocab": {"nontoxic": 0, "toxic": 1},
+        "default_class": 0,
         "pretrained_model": "gpt2-medium",
     },
 }
@@ -415,10 +424,12 @@ def full_text_generation(
         horizon_length=1,
         window_length=0,
         decay=False,
+        r=1,
         gamma=1.5,
         gm_scale=0.9,
         kl_scale=0.01,
         verbosity_level=REGULAR,
+        eval_generations=None,
         **kwargs
 ):
     classifier, class_id = get_classifier(
@@ -454,7 +465,7 @@ def full_text_generation(
     unpert_gen_tok_text, _, _ = generate_text_pplm(
         model=model,
         tokenizer=tokenizer,
-        context=context,
+        context=context[0],
         device=device,
         length=length,
         sample=sample,
@@ -468,11 +479,16 @@ def full_text_generation(
     discrim_losses = []
     losses_in_time = []
 
+    ppls = []
+    if context and type(context[0]) != int:
+        context = iter(context)
     for i in range(num_samples):
-        pert_gen_tok_text, discrim_loss, loss_in_time = generate_text_pplm(
+        eval_text = eval_generations[i] if eval_generations else None #eval mode
+        c = next(context) if type(context) != list else context
+        ret = generate_text_pplm(
             model=model,
             tokenizer=tokenizer,
-            context=context,
+            context=c,
             device=device,
             perturb=True,
             bow_indices=bow_indices,
@@ -489,19 +505,29 @@ def full_text_generation(
             horizon_length=horizon_length,
             window_length=window_length,
             decay=decay,
+            r=r,
             gamma=gamma,
             gm_scale=gm_scale,
             kl_scale=kl_scale,
-            verbosity_level=verbosity_level
+            verbosity_level=verbosity_level,
+            eval_text=eval_text
         )
-        pert_gen_tok_texts.append(pert_gen_tok_text)
-        if classifier is not None:
-            discrim_losses.append(discrim_loss.data.cpu().numpy())
-        losses_in_time.append(loss_in_time)
+        if eval_text:
+            ppl = ret
+            ppls.append(ppl)
+        else:
+            pert_gen_tok_text, discrim_loss, loss_in_time = ret
+            pert_gen_tok_texts.append(pert_gen_tok_text)
+            if classifier is not None:
+                discrim_losses.append(discrim_loss.data.cpu().numpy())
+            losses_in_time.append(loss_in_time)
 
     if device == 'cuda':
         torch.cuda.empty_cache()
 
+    if eval_generations:
+        print(ppls)
+        return np.mean(ppls)
     return unpert_gen_tok_text, pert_gen_tok_texts, discrim_losses, losses_in_time
 
 
@@ -529,61 +555,71 @@ def generate_text_pplm(
         gamma=1.5,
         gm_scale=0.9,
         kl_scale=0.01,
-        verbosity_level=REGULAR
+        r=1,
+        verbosity_level=REGULAR,
+        no_perturb=False,
+        eval_text=None
 ):
-    output_so_far = None
-    if context:
-        context_t = torch.tensor(context, device=device, dtype=torch.long)
-        while len(context_t.shape) < 2:
-            context_t = context_t.unsqueeze(0)
-        output_so_far = context_t
+    generations = []
+    discrim_losses = []
+    losses_in_time = []
+    for it in range(r):
+        output_so_far = None
+        past = None
+        if context:
+            context_t = torch.tensor(context, device=device, dtype=torch.long)
+            while len(context_t.shape) < 2:
+                context_t = context_t.unsqueeze(0)
+            output_so_far = context_t
+        # collect one hot vectors for bags of words
+        one_hot_bows_vectors = build_bows_one_hot_vectors(bow_indices, tokenizer,
+                                                          device)
 
-    # collect one hot vectors for bags of words
-    one_hot_bows_vectors = build_bows_one_hot_vectors(bow_indices, tokenizer,
-                                                      device)
+        grad_norms = None
+        last = None
+        unpert_discrim_loss = 0
+        loss_in_time = []
 
-    grad_norms = None
-    last = None
-    unpert_discrim_loss = 0
-    loss_in_time = []
-
-    if verbosity_level >= VERBOSE:
-        range_func = trange(length, ascii=True)
-    else:
-        range_func = range(length)
-
-    for i in range_func:
-
-        # Get past/probs for current output, except for last word
-        # Note that GPT takes 2 inputs: past + current_token
-
-        # run model forward to obtain unperturbed
-        if past is None and output_so_far is not None:
-            last = output_so_far[:, -1:]
-            if output_so_far.shape[1] > 1:
-                _, past, _ = model(output_so_far[:, :-1])
-
-        unpert_logits, unpert_past, unpert_all_hidden = model(output_so_far)
-        unpert_last_hidden = unpert_all_hidden[-1]
-
-        # check if we are abowe grad max length
-        if i >= grad_length:
-            current_stepsize = stepsize * 0
+        if eval_text: #if we are evaluating
+            range_func = range(len(eval_text))
+            eval_gen = iter(eval_text)
+        elif verbosity_level >= VERBOSE:
+            range_func = trange(length, ascii=True)
         else:
-            current_stepsize = stepsize
+            range_func = range(length)
 
-        # modify the past if necessary
-        if not perturb or num_iterations == 0:
-            pert_past = past
+        total_ll = 0
+        lls = []
+        for i in range_func:
+            # Get past/probs for current output, except for last word
+            # Note that GPT takes 2 inputs: past + current_token
 
-        else:
-            accumulated_hidden = unpert_last_hidden[:, :-1, :]
-            accumulated_hidden = torch.sum(accumulated_hidden, dim=1)
+            # run model forward to obtain unperturbed
+            if past is None and output_so_far is not None:
+                last = output_so_far[:, -1:]
+                if output_so_far.shape[1] > 1:
+                    _, past, _ = model(output_so_far[:, :-1])
+            unpert_logits, unpert_past, unpert_all_hidden = model(output_so_far)
+            unpert_last_hidden = unpert_all_hidden[-1]
 
-            if past is not None:
-                pert_past, _, grad_norms, loss_this_iter = perturb_past(
-                    past,
-                    model,
+            # check if we are abowe grad max length
+            if i >= grad_length:
+                current_stepsize = stepsize * 0
+            else:
+                current_stepsize = stepsize
+
+            # modify the past if necessary
+            if not perturb or num_iterations == 0:
+                pert_past = past
+
+            else:
+                accumulated_hidden = unpert_last_hidden[:, :-1, :]
+                accumulated_hidden = torch.sum(accumulated_hidden, dim=1)
+
+                if past is not None:
+                    pert_past, _, grad_norms, loss_this_iter = perturb_past(
+                        past,
+                        model,
                     last,
                     unpert_past=unpert_past,
                     unpert_logits=unpert_logits,
@@ -601,64 +637,77 @@ def generate_text_pplm(
                     gamma=gamma,
                     kl_scale=kl_scale,
                     device=device,
-                    verbosity_level=verbosity_level
-                )
-                loss_in_time.append(loss_this_iter)
-            else:
-                pert_past = past
+                    verbosity_level=verbosity_level)
+                    loss_in_time.append(loss_this_iter)
+                else:
+                    pert_past = past
 
-        pert_logits, past, pert_all_hidden = model(last, past=pert_past)
-        pert_logits = pert_logits[:, -1, :] / temperature  # + SMALL_CONST
-        pert_probs = F.softmax(pert_logits, dim=-1)
-
-        if classifier is not None:
-            ce_loss = torch.nn.CrossEntropyLoss()
-            prediction = classifier(torch.mean(unpert_last_hidden, dim=1))
-            label = torch.tensor([class_label], device=device,
-                                 dtype=torch.long)
-            unpert_discrim_loss = ce_loss(prediction, label)
-            if verbosity_level >= VERBOSE:
-                print(
-                    "unperturbed discrim loss",
-                    unpert_discrim_loss.data.cpu().numpy()
-                )
-        else:
-            unpert_discrim_loss = 0
-
-        # Fuse the modified model and original model
-        if perturb:
-
-            unpert_probs = F.softmax(unpert_logits[:, -1, :], dim=-1)
-
-            pert_probs = ((pert_probs ** gm_scale) * (
-                    unpert_probs ** (1 - gm_scale)))  # + SMALL_CONST
-            pert_probs = top_k_filter(pert_probs, k=top_k,
-                                      probs=True)  # + SMALL_CONST
-
-            # rescale
-            if torch.sum(pert_probs) <= 1:
-                pert_probs = pert_probs / torch.sum(pert_probs)
-
-        else:
-            pert_logits = top_k_filter(pert_logits, k=top_k)  # + SMALL_CONST
+            pert_logits, past, pert_all_hidden = model(last, past=pert_past)
+            pert_logits = pert_logits[:, -1, :] / temperature  # + SMALL_CONST
             pert_probs = F.softmax(pert_logits, dim=-1)
 
-        # sample or greedy
-        if sample:
-            last = torch.multinomial(pert_probs, num_samples=1)
+            if classifier is not None:
+                ce_loss = torch.nn.CrossEntropyLoss()
+                prediction = classifier(torch.mean(unpert_last_hidden, dim=1))
+                label = torch.tensor([class_label], device=device,
+                                     dtype=torch.long)
+                unpert_discrim_loss = ce_loss(prediction, label)
+                if verbosity_level >= VERBOSE:
+                    print(
+                        "unperturbed discrim loss",
+                        unpert_discrim_loss.data.cpu().numpy()
+                    )
+            else:
+                unpert_discrim_loss = 0
 
-        else:
-            _, last = torch.topk(pert_probs, k=1, dim=-1)
+            # Fuse the modified model and original model
+            if perturb:
 
-        # update context/output_so_far appending the new token
-        output_so_far = (
-            last if output_so_far is None
-            else torch.cat((output_so_far, last), dim=1)
-        )
-        if verbosity_level >= REGULAR:
-            print(tokenizer.decode(output_so_far.tolist()[0]))
+                unpert_probs = F.softmax(unpert_logits[:, -1, :], dim=-1)
 
-    return output_so_far, unpert_discrim_loss, loss_in_time
+                pert_probs = ((pert_probs ** gm_scale) * (
+                        unpert_probs ** (1 - gm_scale)))  # + SMALL_CONST
+                if not eval_text:
+                    pert_probs = top_k_filter(pert_probs, k=top_k,
+                                          probs=True)  # + SMALL_CONST
+
+                # rescale
+                if torch.sum(pert_probs) <= 1:
+                    pert_probs = pert_probs / torch.sum(pert_probs)
+
+            else:
+                pert_logits = top_k_filter(pert_logits, k=top_k)  # + SMALL_CONST
+                if not eval_text:
+                    pert_probs = F.softmax(pert_logits, dim=-1)
+
+            # sample or greedy
+            if eval_text:
+                next_elem = next(eval_gen)
+                last = torch.tensor([[next_elem]]).cuda()
+                prob = pert_probs[0][next_elem].item()
+                # import pdb; pdb.set_trace()
+                total_ll += math.log(prob)
+                lls.append(prob)
+            elif sample:
+                last = torch.multinomial(pert_probs, num_samples=1)
+            else:
+                _, last = torch.topk(pert_probs, k=1, dim=-1)
+
+            # update context/output_so_far appending the new token
+            output_so_far = (
+                last if output_so_far is None
+                else torch.cat((output_so_far, last), dim=1)
+            )
+            if verbosity_level >= REGULAR:
+                print(tokenizer.decode(output_so_far.tolist()[0]))
+        discrim_losses.append(unpert_discrim_loss)
+        generations.append(output_so_far)
+        losses_in_time.append(loss_in_time)
+    best_idx = np.argmin(discrim_losses) 
+    best_generation, best_discrim_loss, best_loss_in_time = generations[best_idx], discrim_losses[best_idx], losses_in_time[best_idx]
+    if eval_text: #convert probability to ppl
+        return math.exp(-(total_ll / len(eval_text)))
+    return best_generation, best_discrim_loss, best_loss_in_time
 
 
 def set_generic_model_params(discrim_weights, discrim_meta):
@@ -674,10 +723,20 @@ def set_generic_model_params(discrim_weights, discrim_meta):
     meta['path'] = discrim_weights
     DISCRIMINATOR_MODELS_PARAMS['generic'] = meta
 
+def tokenize_generations(filename, tokenizer):
+    generations = []
+    with open(filename, "r") as f:
+        for line in f:
+            generations.append(line.rstrip())
+    # convert text to tokens
+    generations = [tokenizer.encode(elem, add_special_tokens=False) for elem in generations]
+    print(generations[:3])
+    return generations
 
 def run_pplm_example(
         pretrained_model="gpt2-medium",
         cond_text="",
+        cond_file="",
         uncond=False,
         num_samples=1,
         bag_of_words=None,
@@ -701,7 +760,12 @@ def run_pplm_example(
         seed=0,
         no_cuda=False,
         colorama=False,
-        verbosity='regular'
+        verbosity='regular',
+        out_file=None,
+        evaluation_file=None,
+        r=1,
+        discrim_path="",
+        no_perturb=False
 ):
     # set Random seed
     torch.manual_seed(seed)
@@ -716,6 +780,8 @@ def run_pplm_example(
     if discrim == 'generic':
         set_generic_model_params(discrim_weights, discrim_meta)
 
+    if discrim_path:
+        DISCRIMINATOR_MODELS_PARAMS[discrim]["path"] = discrim_path
     if discrim is not None:
         discriminator_pretrained_model = DISCRIMINATOR_MODELS_PARAMS[discrim][
             "pretrained_model"
@@ -737,12 +803,22 @@ def run_pplm_example(
     # load tokenizer
     tokenizer = GPT2Tokenizer.from_pretrained(pretrained_model)
 
+    #ppl
+    if evaluation_file:
+        eval_generations = tokenize_generations(evaluation_file, tokenizer) if evaluation_file else None
+        num_samples = len(eval_generations)
+    else:
+        eval_generations = None
     # Freeze GPT-2 weights
     for param in model.parameters():
         param.requires_grad = False
 
     # figure out conditioning text
-    if uncond:
+    if cond_file:
+        tokenized_cond_texts = tokenize_generations(cond_file, tokenizer)
+        num_samples = len(tokenized_cond_texts)
+        tokenized_cond_text = tokenized_cond_texts
+    elif uncond:
         tokenized_cond_text = tokenizer.encode(
             [tokenizer.bos_token],
             add_special_tokens=False
@@ -753,19 +829,23 @@ def run_pplm_example(
             print("Did you forget to add `--cond_text`? ")
             raw_text = input("Model prompt >>> ")
         tokenized_cond_text = tokenizer.encode(
-            tokenizer.bos_token + raw_text,
+            raw_text,
             add_special_tokens=False
         )
 
-    print("= Prefix of sentence =")
-    print(tokenizer.decode(tokenized_cond_text))
+    if not cond_file:
+        print("= Prefix of sentence =")
+        print(tokenizer.decode(tokenized_cond_text))
+    else:
+        print("= First 3 prompts =")
+        print([tokenizer.decode(t) for t in tokenized_cond_texts[:3]])
     print()
 
     # generate unperturbed and perturbed texts
 
     # full_text_generation returns:
     # unpert_gen_tok_text, pert_gen_tok_texts, discrim_losses, losses_in_time
-    unpert_gen_tok_text, pert_gen_tok_texts, _, _ = full_text_generation(
+    ret = full_text_generation(
         model=model,
         tokenizer=tokenizer,
         context=tokenized_cond_text,
@@ -787,9 +867,20 @@ def run_pplm_example(
         gamma=gamma,
         gm_scale=gm_scale,
         kl_scale=kl_scale,
-        verbosity_level=verbosity_level
+        no_perturb = no_perturb,
+        verbosity_level=verbosity_level,
+        r=r,
+        eval_generations=eval_generations
     )
 
+    if eval_generations:
+        avg_ppl = ret
+        print(avg_ppl)
+        return avg_ppl
+    else:
+        unpert_gen_tok_text, pert_gen_tok_texts, _, _ = ret
+    print(eval_generations)
+    print(pert_gen_tok_texts)
     # untokenize unperturbed text
     unpert_gen_text = tokenizer.decode(unpert_gen_tok_text.tolist()[0])
 
@@ -811,36 +902,45 @@ def run_pplm_example(
             # w[0] because we are sure w has only 1 item because previous fitler
             bow_word_ids.update(w[0] for w in filtered)
 
+    generations = []
     # iterate through the perturbed texts
     for i, pert_gen_tok_text in enumerate(pert_gen_tok_texts):
-        try:
-            # untokenize unperturbed text
-            if colorama:
-                import colorama
+        if eval_generations:
+            pert_gen_tok_text = pert_gen_tok_text[:,len(tokenized_cond_text[i]):] # cut off prompt
+        elif cond_file:
+            pert_gen_tok_text = pert_gen_tok_text[:, len(tokenized_cond_text[i]):]
+        else:
+            pert_gen_tok_text = pert_gen_tok_text[:,len(tokenized_cond_text):] # cut off prompt
+        # untokenize unperturbed text
+        if colorama:
+            import colorama
 
-                pert_gen_text = ''
-                for word_id in pert_gen_tok_text.tolist()[0]:
-                    if word_id in bow_word_ids:
-                        pert_gen_text += '{}{}{}'.format(
-                            colorama.Fore.RED,
-                            tokenizer.decode([word_id]),
-                            colorama.Style.RESET_ALL
-                        )
-                    else:
-                        pert_gen_text += tokenizer.decode([word_id])
-            else:
-                pert_gen_text = tokenizer.decode(pert_gen_tok_text.tolist()[0])
+            pert_gen_text = ''
+            for word_id in pert_gen_tok_text.tolist()[0]:
+                if word_id in bow_word_ids:
+                    pert_gen_text += '{}{}{}'.format(
+                        colorama.Fore.RED,
+                        tokenizer.decode([word_id]),
+                        colorama.Style.RESET_ALL
+                    )
+                else:
+                    pert_gen_text += tokenizer.decode([word_id])
+        else:
+            pert_gen_text = tokenizer.decode(pert_gen_tok_text.tolist()[0])
 
-            print("= Perturbed generated text {} =".format(i + 1))
-            print(pert_gen_text)
-            print()
-        except:
-            pass
+        print("= Perturbed generated text {} =".format(i + 1))
+        print(pert_gen_text)
+        generations.append(pert_gen_text.replace("<|endoftext|>.  ", " ").replace("\n", "").replace("<|endoftext|>", "").strip() + "\n")
+        print()
 
         # keep the prefix, perturbed seq, original seq for each index
         generated_texts.append(
             (tokenized_cond_text, pert_gen_tok_text, unpert_gen_tok_text)
         )
+    print(generations)
+    with open(out_file, "w+") as f:
+        f.writelines(generations)
+    print("Wrote to file {}".format(out_file))
 
     return
 
@@ -857,6 +957,10 @@ if __name__ == '__main__':
     parser.add_argument(
         "--cond_text", type=str, default="The lake",
         help="Prefix texts to condition on"
+    )
+    parser.add_argument(
+        "--cond_file", type=str, default="",
+        help="Text file containing prompts"
     )
     parser.add_argument(
         "--uncond", action="store_true",
@@ -913,6 +1017,12 @@ if __name__ == '__main__':
              "0 corresponds to infinite window length",
     )
     parser.add_argument(
+        "--r",
+        type=int,
+        default=1,
+        help="Choose best of r samples based on discrim_loss"
+    )
+    parser.add_argument(
         "--horizon_length",
         type=int,
         default=1,
@@ -931,6 +1041,9 @@ if __name__ == '__main__':
                         choices=(
                             "quiet", "regular", "verbose", "very_verbose"),
                         help="verbosiry level")
-
+    parser.add_argument("--out_file", type=str, default="", help="output generation file")
+    parser.add_argument("--evaluation_file", type=str, default="", help="generation file for evaluation")
+    parser.add_argument("--discrim_path", type=str, default="", help="discriminator path")
+    parser.add_argument("--no_perturb", action="store_true", help="don't perturb past")
     args = parser.parse_args()
     run_pplm_example(**vars(args))

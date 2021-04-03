@@ -1,6 +1,3 @@
-#! /usr/bin/env python3
-# coding=utf-8
-
 # This code is licensed under a non-commercial license.
 
 import argparse
@@ -28,8 +25,8 @@ torch.manual_seed(0)
 np.random.seed(0)
 EPSILON = 1e-10
 example_sentence = "This is incredible! I love it, this is the best chicken I have ever had."
-max_length_seq = 100
-
+max_length_seq = 1024 # used to be 100
+DEVICE= 'cpu'
 
 class Discriminator(torch.nn.Module):
     """Transformer encoder followed by a Classification Head"""
@@ -40,7 +37,7 @@ class Discriminator(torch.nn.Module):
             pretrained_model="gpt2-medium",
             classifier_head=None,
             cached_mode=False,
-            device='cpu'
+            device=DEVICE
     ):
         super(Discriminator, self).__init__()
         if pretrained_model.startswith("gpt2"):
@@ -235,7 +232,7 @@ def predict(input_sentence, model, classes, cached=False, device='cpu'):
 
 
 def get_cached_data_loader(dataset, batch_size, discriminator,
-                           shuffle=False, device='cpu'):
+                           shuffle=False, device=DEVICE):
     data_loader = torch.utils.data.DataLoader(dataset=dataset,
                                               batch_size=batch_size,
                                               collate_fn=collate_fn)
@@ -279,6 +276,7 @@ def get_generic_dataset(dataset_fp, tokenizer, device,
     x = []
     y = []
     with open(dataset_fp) as f:
+        skipped = 0
         csv_reader = csv.reader(f, delimiter="\t")
         for i, row in enumerate(tqdm(csv_reader, ascii=True)):
             if row:
@@ -297,10 +295,9 @@ def get_generic_dataset(dataset_fp, tokenizer, device,
                         )
 
                     else:
-                        print(
-                            "Line {} is longer than maximum length {}".format(
-                                i, max_length_seq
-                            ))
+                        skipped +=1
+                        if skipped % 100 == 0:
+                            print("Line {}: Skipped {}th line longer than {}".format(i, skipped, max_length_seq))
                         continue
 
                     x.append(seq)
@@ -475,6 +472,7 @@ def train_discriminator(
         x = []
         y = []
         with open("datasets/toxic/toxic_train.txt") as f:
+            skipped = 0
             for i, line in enumerate(tqdm(f, ascii=True)):
                 try:
                     d = eval(line)
@@ -487,9 +485,9 @@ def train_discriminator(
                             seq, device=device, dtype=torch.long
                         )
                     else:
-                        print("Line {} is longer than maximum length {}".format(
-                            i, max_length_seq
-                        ))
+                        skipped +=1
+                        if skipped % 100 == 0:
+                            print("Line {}: Skipped {}th line longer than {}".format(i, skipped, max_length_seq))
                         continue
                     x.append(seq)
                     y.append(int(np.sum(d["label"]) > 0))
@@ -646,7 +644,7 @@ def train_discriminator(
     return discriminator, discriminator_meta
 
 
-def load_classifier_head(weights_path, meta_path, device='cpu'):
+def load_classifier_head(weights_path, meta_path, device=DEVICE):
     with open(meta_path, 'r', encoding="utf8") as f:
         meta_params = json.load(f)
     classifier_head = ClassificationHead(
@@ -659,7 +657,7 @@ def load_classifier_head(weights_path, meta_path, device='cpu'):
     return classifier_head, meta_params
 
 
-def load_discriminator(weights_path, meta_path, device='cpu'):
+def load_discriminator(weights_path, meta_path, device=DEVICE):
     classifier_head, meta_param = load_classifier_head(
         weights_path, meta_path, device
     )
