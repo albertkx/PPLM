@@ -38,7 +38,7 @@ from transformers.file_utils import cached_path
 from transformers.modeling_gpt2 import GPT2LMHeadModel
 
 from pplm_classification_head import ClassificationHead
-
+from tqdm import tqdm
 PPLM_BOW = 1
 PPLM_DISCRIM = 2
 PPLM_BOW_DISCRIM = 3
@@ -482,7 +482,7 @@ def full_text_generation(
     ppls = []
     if context and type(context[0]) != int:
         context = iter(context)
-    for i in range(num_samples):
+    for i in tqdm(range(num_samples)):
         eval_text = eval_generations[i] if eval_generations else None #eval mode
         c = next(context) if type(context) != list else context
         ret = generate_text_pplm(
@@ -519,7 +519,7 @@ def full_text_generation(
             pert_gen_tok_text, discrim_loss, loss_in_time = ret
             pert_gen_tok_texts.append(pert_gen_tok_text)
             if classifier is not None:
-                discrim_losses.append(discrim_loss.data.cpu().numpy())
+                discrim_losses.append(discrim_loss)
             losses_in_time.append(loss_in_time)
 
     if device == 'cuda':
@@ -651,11 +651,11 @@ def generate_text_pplm(
                 prediction = classifier(torch.mean(unpert_last_hidden, dim=1))
                 label = torch.tensor([class_label], device=device,
                                      dtype=torch.long)
-                unpert_discrim_loss = ce_loss(prediction, label)
+                unpert_discrim_loss = ce_loss(prediction, label).data.cpu().numpy()
                 if verbosity_level >= VERBOSE:
                     print(
                         "unperturbed discrim loss",
-                        unpert_discrim_loss.data.cpu().numpy()
+                        unpert_discrim_loss
                     )
             else:
                 unpert_discrim_loss = 0
@@ -729,7 +729,7 @@ def tokenize_generations(filename, tokenizer):
         for line in f:
             generations.append(line.rstrip())
     # convert text to tokens
-    generations = [tokenizer.encode(elem, add_special_tokens=False) for elem in generations]
+    generations = [tokenizer.encode(tokenizer.bos_token + elem, add_special_tokens=False) for elem in generations]
     print(generations[:3])
     return generations
 

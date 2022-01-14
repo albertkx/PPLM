@@ -25,8 +25,8 @@ torch.manual_seed(0)
 np.random.seed(0)
 EPSILON = 1e-10
 example_sentence = "This is incredible! I love it, this is the best chicken I have ever had."
-max_length_seq = 1024 # used to be 100
-DEVICE= 'cpu'
+max_length_seq = 128 # used to be 100
+DEVICE= 'cuda'
 
 class Discriminator(torch.nn.Module):
     """Transformer encoder followed by a Classification Head"""
@@ -40,7 +40,7 @@ class Discriminator(torch.nn.Module):
             device=DEVICE
     ):
         super(Discriminator, self).__init__()
-        if pretrained_model.startswith("gpt2"):
+        if True: # Hardcode
             self.tokenizer = GPT2Tokenizer.from_pretrained(pretrained_model)
             self.encoder = GPT2LMHeadModel.from_pretrained(pretrained_model)
             self.embed_size = self.encoder.transformer.config.hidden_size
@@ -324,7 +324,7 @@ def train_discriminator(
         output_fp='.'
 ):
     device = "cuda" if torch.cuda.is_available() and not no_cuda else "cpu"
-    add_eos_token = pretrained_model.startswith("gpt2")
+    add_eos_token = True # Hardcode
 
     if save_model:
         if not os.path.exists(output_fp):
